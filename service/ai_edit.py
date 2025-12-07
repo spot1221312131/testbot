@@ -1,0 +1,148 @@
+import asyncio
+import aiohttp
+from pathlib import Path
+from runwayml import AsyncRunwayML
+
+
+
+ALLOWED_RATIOS = [
+    (1104, 832),
+    (1280, 720),
+    (1584, 672),
+    (640, 480),
+    (720, 1280),
+    (832, 1194),
+    (848, 480),
+    (960, 960),
+]
+
+
+async def get_video_resolution_async(file_path: str) -> tuple[int, int]:
+    process = await asyncio.create_subprocess_exec(
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "csv=p=0",
+        file_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+
+    stdout, stderr = await process.communicate()
+
+    if process.returncode != 0:
+        raise RuntimeError(f'ошибка ффмпег при получении разрешения видео: {stderr.decode()}')
+    
+    width, height = map(int, stdout.decode().strip().split(','))
+    return width, height
+
+
+def find_closest_ratio(width: int, height: int) -> str:
+    best = None
+    best_diff = None
+
+    for w, h in ALLOWED_RATIOS:
+        diff = abs(width - w) + abs(height - h)
+
+        if best_diff is None or diff < best_diff:
+            best = (w, h)
+            best_diff = diff
+
+    return f"{best[0]}:{best[1]}"
+
+async def process_videos(
+        videos_with_promts: dict[str, str],
+        api_key: str,
+) -> list[str]:
+    
+    client = AsyncRunwayML(api_key=api_key)
+
+    tasks = []
+
+    for file_path, promt in videos_with_promts.items():
+        
+        task = process_single_video_with_own_prompt(
+            client=client,
+            file_path=file_path,
+            promt=promt
+        )
+
+        tasks.append(task)
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    output_files = []
+
+    for result in results:
+        if isinstance(result, Exception):
+            print('ошибка', result)
+        else:
+            output_files.append(result)
+
+    return output_files
+
+
+
+
+async def process_single_video_with_own_prompt(
+        client: AsyncRunwayML,
+        file_path: str,
+        promt: str
+) -> str:
+    
+    path = Path(file_path)
+
+    output_path = str(path.with_stem(path.stem + "_neuro"))
+
+    width, height = await get_video_resolution_async(file_path)
+    ratio = find_closest_ratio(width, height)
+
+    for attempt in range(1, 4):
+        try:
+            with open(file_path, "rb") as f:
+                upload = await client.uploads.create_ephemeral(
+                    file=f,
+                )
+            
+            video_uri = upload.uri
+
+            task = await client.video_to_video.create(
+                model="gen4_aleph",
+                video_uri=video_uri,
+                prompt_text=promt,
+                ratio=ratio,
+                seed=42
+            )
+
+            task_id = task.id
+
+            while True:
+                status = await client.tasks.retrieve(task_id)
+                
+                if status.status == 'SUCCEEDED':
+                    output_url = status.output
+                    break
+
+                if status.status in ("FAILED", "CANCELLED"):
+                    raise RuntimeError(f'runway не смог обработать видео: {status}')
+                
+                await asyncio.sleep(5)
+
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(output_url) as resp:
+
+                    if resp.status != 200:
+                        raise RuntimeError('ошибка при скачивании файла')
+                    
+                    with open(output_path, "wb") as f:
+                        f.write(await resp.read())
+
+            return output_path
+
+        except Exception as e:
+            print(f'попытка {attempt} для {output_path} неудачна', e)
+
+            if attempt == 3:
+                raise RuntimeError('все попытки потрачены')
